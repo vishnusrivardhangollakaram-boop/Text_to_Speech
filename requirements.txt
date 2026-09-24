@@ -1,3 +1,6 @@
-streamlit
-transformers<5.0.0
-torch
+streamlit>=1.64
+transformers>=5.10
+torch>=2.0
+edge-tts>=6.1
+pillow>=10.0
+openai>=1.40
