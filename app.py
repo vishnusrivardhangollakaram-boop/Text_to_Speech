@@ -1,31 +1,49 @@
-# Program title: Simple Storytelling App (Text to Story + Audio)
+# Program title: Storytelling App
 
+# Import part
+from PIL import Image
 import streamlit as st
 from transformers import pipeline
 
-# Set up the page
-st.set_page_config(page_title="Text to Audio Story", page_icon="🦜")
-st.header("Turn Your Text into an Audio Story")
+# Function part
+def img2text(image_input):
+    image_to_text_model = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
+    text = image_to_text_model(image_input)[0]["generated_text"]
+    return text
 
-# User enters text
-user_text = st.text_area("Enter a prompt or scenario for your story:")
+# Main part
+st.set_page_config(page_title="Your Image to Audio Story", page_icon="🦜")
+st.header("Turn Your Image to Audio Story")
 
-if user_text:
-    # Stage 1: Text to Story
+uploaded_file = st.file_uploader("Select an Image...")
+
+if uploaded_file is not None:
+    # Save file locally (matching your original logic)
+    bytes_data = uploaded_file.getvalue()
+    with open(uploaded_file.name, "wb") as file:
+        file.write(bytes_data)
+
+    # Fixed: use_container_width replaces the deprecated use_column_width
+    st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+
+    # Stage 1: Image to Text (Using the function)
+    st.text('Processing img2text...')
+    scenario = img2text(uploaded_file.name)
+    st.write(f"**Scenario:** {scenario}")
+
+    # Stage 2: Text to Story (Inline)
     st.text('Generating a story...')
-    story_generator = pipeline("text-generation", model="pranavpsv/genre-story-generator-v2")
-    story = story_generator(user_text)[0]['generated_text']
-    st.write(story)
+    story_pipe = pipeline("text-generation", model="pranavpsv/genre-story-generator-v2")
+    story_results = story_pipe(scenario)
+    story = story_results[0]['generated_text']
+    st.write(f"**Story:** {story}")
 
-    # Stage 2: Story to Audio
+    # Stage 3: Story to Audio (Inline)
     st.text('Generating audio data...')
-    audio_generator = pipeline("text-to-audio", model="Matthijs/mms-tts-eng")
-    speech_output = audio_generator(story)
+    audio_pipe = pipeline("text-to-audio", model="Matthijs/mms-tts-eng")
+    audio_data = audio_pipe(story)
 
-    # Play button
-    if st.button("Play Audio"):
-        audio_array = speech_output["audio"]
-        sample_rate = speech_output["sampling_rate"]
-        # Play audio directly using Streamlit
-        st.audio(audio_array,
-                 sample_rate=sample_rate)
+    # Directly display audio player to avoid rerun cycles
+    audio_array = audio_data["audio"]
+    sample_rate = audio_data["sampling_rate"]
+    st.audio(audio_array, sample_rate=sample_rate)
