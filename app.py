@@ -21,7 +21,7 @@ import io
 import edge_tts
 import streamlit as st
 from PIL import Image, ImageOps
-from transformers import pipeline, AutoProcessor, AutoModelForCausalLM
+from transformers import pipeline, AutoProcessor, AutoModelForCausalLM, AutoTokenizer
 
 # ============================================================================ #
 # 配置常量
@@ -112,13 +112,17 @@ def image_to_base64(img: Image.Image, fmt: str = "JPEG", quality: int = 85) -> s
 # ============================================================================ #
 def extract_details(image: Image.Image) -> str:
     """
-    读图提取细节（Florence-2 官方 processor + model 用法，trust_remote_code）。
-    说明：transformers 5.x 的 Florence2Processor 有 image_token 硬编码 bug（Florence-2 用
-    RobertaTokenizer，无 image_token 属性），故锁定 transformers==4.44.2，用 4.x 时代的
-    trust_remote_code 用法。按需加载、用完释放。
+    读图提取细节（Florence-2 官方 processor + model 用法）。
+    说明：transformers 5.x 的 Florence2Processor.__init__ 硬编码访问 tokenizer.image_token，
+    而 Florence-2 的 RobertaTokenizer 无此属性（报 RobertaTokenizer has no attribute image_token）。
+    故手动加载 tokenizer、补上 image_token / image_token_id（值 "<image>"，见 convert 脚本），再传给 processor。
     """
-    processor = AutoProcessor.from_pretrained(CAPTION_MODEL, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(CAPTION_MODEL, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(CAPTION_MODEL)
+    if not hasattr(tokenizer, "image_token"):
+        tokenizer.image_token = "<image>"
+        tokenizer.image_token_id = tokenizer.convert_tokens_to_ids("<image>")
+    processor = AutoProcessor.from_pretrained(CAPTION_MODEL, tokenizer=tokenizer)
+    model = AutoModelForCausalLM.from_pretrained(CAPTION_MODEL)
     try:
         task = "<MORE_DETAILED_CAPTION>"
         inputs = processor(text=task, images=image, return_tensors="pt")
@@ -132,7 +136,7 @@ def extract_details(image: Image.Image) -> str:
         parsed = processor.post_process_generation(generated_text, task=task, image_size=image.size)
         return parsed[task].strip()
     finally:
-        del model, processor
+        del model, processor, tokenizer
         gc.collect()
 
 
