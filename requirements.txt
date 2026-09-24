@@ -1,6 +1,7 @@
 streamlit>=1.64
 transformers>=5.10
-torch>=2.0
+torch>=2.9
+torchvision>=0.24
 edge-tts>=6.1
 pillow>=10.0
 openai>=1.40
