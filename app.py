@@ -15,12 +15,13 @@ Image Storyteller — 上传图片 → 生成英文故事 → 朗读
 import asyncio
 import base64
 import gc
+import html
 import io
 
 import edge_tts
 import streamlit as st
 from PIL import Image, ImageOps
-from transformers import pipeline
+from transformers import pipeline, AutoProcessor, AutoModelForCausalLM
 
 # ============================================================================ #
 # 配置常量
@@ -111,16 +112,27 @@ def image_to_base64(img: Image.Image, fmt: str = "JPEG", quality: int = 85) -> s
 # ============================================================================ #
 def extract_details(image: Image.Image) -> str:
     """
-    读图提取细节（image-to-text pipeline）。
-    说明：此处按需加载模型、用完即释放（函数返回后局部变量被 GC），
-    以避免 Cloud 1GB 内存同时容纳两个模型而 OOM。
+    读图提取细节（Florence-2 官方 processor + model 用法，trust_remote_code）。
+    说明：transformers 5.x 的 Florence2Processor 有 image_token 硬编码 bug（Florence-2 用
+    RobertaTokenizer，无 image_token 属性），故锁定 transformers==4.44.2，用 4.x 时代的
+    trust_remote_code 用法。按需加载、用完释放。
     """
-    captioner = pipeline("image-text-to-text", model=CAPTION_MODEL)
+    processor = AutoProcessor.from_pretrained(CAPTION_MODEL, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(CAPTION_MODEL, trust_remote_code=True)
     try:
-        result = captioner(image, text="<MORE_DETAILED_CAPTION>")[0]["generated_text"]
-        return result.strip()
+        task = "<MORE_DETAILED_CAPTION>"
+        inputs = processor(text=task, images=image, return_tensors="pt")
+        generated_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=256,
+            num_beams=3,
+        )
+        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        parsed = processor.post_process_generation(generated_text, task=task, image_size=image.size)
+        return parsed[task].strip()
     finally:
-        del captioner
+        del model, processor
         gc.collect()
 
 
@@ -209,18 +221,17 @@ def friendly_hf_error(e: Exception) -> str:
 
 
 def generate_story(
-    image: Image.Image,
+    description: str,
     story_model: dict,
     style_desc: str,
     words: int,
     token: str,
 ) -> str:
-    """故事生成编排器：读图固定 Florence-2，编故事按所选模型分发，并统一裁剪到目标词数。"""
-    details = extract_details(image)  # 读图固定 Florence-2
+    """故事生成编排器：基于已提取的图片描述，按所选模型编故事，并统一裁剪到目标词数。"""
     if story_model["kind"] == "llm":
-        story = generate_story_llm(details, story_model["id"], style_desc, words, token)
+        story = generate_story_llm(description, story_model["id"], style_desc, words, token)
     else:
-        story = generate_story_pipeline(details, style_desc, words, story_model["id"])
+        story = generate_story_pipeline(description, style_desc, words, story_model["id"])
     return trim_to_sentence_boundary(story, words)
 
 
@@ -351,6 +362,28 @@ def inject_css() -> None:
             display: block;
         }
 
+        /* ---- 图片描述卡片 ---- */
+        .desc-card {
+            border: 1px solid rgba(110,86,58,.22);
+            border-radius: 0;
+            padding: 14px 18px;
+            margin-bottom: 16px;
+            background: rgba(255,251,242,.72);
+            backdrop-filter: blur(8px);
+            animation: fadeSlideIn .55s cubic-bezier(.22,.61,.36,1);
+        }
+        .desc-card .desc-label {
+            font-size: 12px;
+            font-weight: 700;
+            color: #8a7a66;
+            margin-right: 8px;
+        }
+        .desc-card .desc-text {
+            font-size: 14px;
+            line-height: 1.7;
+            color: #3a2e23;
+        }
+
         /* ---- 故事卡片 ---- */
         .story-card {
             border: 1px solid rgba(110,86,58,.22);
@@ -425,6 +458,15 @@ def render_preview_frame(image: Image.Image | None) -> None:
     )
 
 
+def render_description(desc: str) -> None:
+    """渲染图片描述（读图结果），显示在文件上传框下方。"""
+    st.markdown(
+        f'<div class="desc-card"><span class="desc-label">Description:</span>'
+        f'<span class="desc-text">{html.escape(desc)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_story_card(story: str) -> None:
     """渲染故事卡片（含词数统计）。"""
     word_count = len(story.split())
@@ -465,6 +507,7 @@ def init_state() -> None:
         "audio": None,
         "file_id": None,
         "tts_key": None,
+        "description": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -481,10 +524,20 @@ def handle_upload(uploaded) -> bool:
     if error:
         st.error(error)
         return False
-    st.session_state.image = load_image(uploaded)
+    image = load_image(uploaded)
+    st.session_state.image = image
     st.session_state.story = None
     st.session_state.audio = None
     st.session_state.tts_key = None
+    st.session_state.description = None
+    # 读图提取描述（上传后立即执行，结果在文件框下方展示）
+    with st.status("🔍 Analyzing your image...", expanded=False) as status:
+        try:
+            st.session_state.description = extract_details(image)
+            status.update(label="✅ Image analyzed!", state="complete", expanded=False)
+        except Exception as e:
+            status.update(label="Image analysis failed", state="error", expanded=True)
+            st.error(f"Image analysis failed: {e}")
     return True
 
 
@@ -556,6 +609,10 @@ def main() -> None:
     if uploaded is not None and handle_upload(uploaded):
         st.rerun()  # 换图后立即重跑，避免残留旧内容
 
+    # 3.5 图片描述（读图后，文件框下方显示）
+    if st.session_state.description:
+        render_description(st.session_state.description)
+
     # 4. 生成按钮（始终显示，生成后位于上传区下方）
     button_label = "↻ Regenerate" if st.session_state.story else "✨ Generate Story"
     generate_clicked = st.button(button_label, type="primary")
@@ -563,13 +620,15 @@ def main() -> None:
     if generate_clicked:
         if st.session_state.image is None:
             st.error("Please upload an image first.")
+        elif st.session_state.description is None:
+            st.error("Image analysis failed. Please re-upload the image.")
         elif story_model["kind"] == "llm" and not hf_token:
             st.error("Please enter an HF Token in the sidebar.")
         else:
             with st.status("✍️ Writing a story...", expanded=False) as status:
                 try:
                     st.session_state.story = generate_story(
-                        st.session_state.image,
+                        st.session_state.description,
                         story_model,
                         style_desc,
                         words,
